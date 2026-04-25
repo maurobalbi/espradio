@@ -18,7 +18,7 @@ func main() {
 
 	println("initializing radio...")
 	err := espradio.Enable(espradio.Config{
-		Logging: espradio.LogLevelError,
+		Logging: espradio.LogLevelDebug,
 	})
 	if err != nil {
 		failure("could not enable radio: " + err.Error())
@@ -28,6 +28,23 @@ func main() {
 	err = espradio.Start()
 	if err != nil {
 		failure("could not start radio: " + err.Error())
+	}
+
+	println("pre-scanning...")
+	aps, err := espradio.Scan()
+	if err != nil {
+		println("scan failed:", err)
+		return
+	}
+	found := false
+	for _, ap := range aps {
+		println("  ", ap.SSID, "RSSI", ap.RSSI)
+		if ap.SSID == ssid {
+			found = true
+		}
+	}
+	if !found {
+		println("target AP", ssid, "not in scan results!")
 	}
 
 	println("connecting to", ssid, "...")

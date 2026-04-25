@@ -1,6 +1,9 @@
 esp-wifi
 ./vscode
+.vscode
 *.bin
 *.elf
 build
+.DS_Store
 
+espradio.code-workspace

@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include "sdkconfig.h"
+
+/* ROM printf only — never libprintf.a (varargs broken from Clang). */
+extern int ets_printf(const char *fmt, ...);
 
 #ifdef __XTENSA__
 #define ESPRADIO_MEMORY_BARRIER() __asm__ volatile ("memw" ::: "memory")
@@ -30,43 +33,51 @@ static const char *exccause_name(uint32_t cause) {
 }
 
 void espradio_user_exception(uint32_t cause, uint32_t epc, uint32_t excvaddr, uint32_t *frame) {
-    /* Write crash signature to RTC STORE registers (survive across reset) */
+    /* Write crash signature to RTC STORE registers (survive across reset).
+     * ESP32 peripherals at 0x3FF4xxxx; ESP32-S3 at 0x6000xxxx. */
+#if CONFIG_IDF_TARGET_ESP32
+    volatile uint32_t *store0 = (volatile uint32_t *)0x3FF48050;
+    volatile uint32_t *store1 = (volatile uint32_t *)0x3FF48054;
+    volatile uint32_t *store2 = (volatile uint32_t *)0x3FF48058;
+#else
     volatile uint32_t *store0 = (volatile uint32_t *)0x60008050;
     volatile uint32_t *store1 = (volatile uint32_t *)0x60008054;
     volatile uint32_t *store2 = (volatile uint32_t *)0x60008058;
+#endif
     *store0 = 0x55570000 | (cause & 0xFFFF);  /* 0x5557 = user exception marker */
     *store1 = epc;
     *store2 = excvaddr;
 
-    printf("\n*** USER EXCEPTION ***\n");
-    printf("  EXCCAUSE = %lu (%s)\n", (unsigned long)cause, exccause_name(cause));
-    printf("  EPC1     = 0x%08lx\n", (unsigned long)epc);
-    printf("  EXCVADDR = 0x%08lx\n", (unsigned long)excvaddr);
+    ets_printf("\n*** USER EXCEPTION ***\n");
+    ets_printf("  EXCCAUSE = %d (%s)\n", (int)cause, exccause_name(cause));
+    ets_printf("  EPC1     = 0x%x\n", (unsigned)epc);
+    ets_printf("  EXCVADDR = 0x%x\n", (unsigned)excvaddr);
     /* Dump WindowBase and WindowStart to see register window state */
     uint32_t wb, ws;
     __asm__ volatile ("rsr %0, WINDOWBASE" : "=r"(wb));
     __asm__ volatile ("rsr %0, WINDOWSTART" : "=r"(ws));
-    printf("  WINDOWBASE = %lu  WINDOWSTART = 0x%04lx\n",
-           (unsigned long)wb, (unsigned long)ws);
+    ets_printf("  WINDOWBASE = %d  WINDOWSTART = 0x%x\n", (int)wb, (unsigned)ws);
     /* Dump saved registers from the exception frame.
      * Layout:  0:a0  4:a1(orig)  8:a2  12:a3  16:a4  20:a5
      *         24:a6  28:a7  32:a8  36:a9  40:a10 44:a11
      *         48:a12 52:a13 56:a14 60:a15  64:SAR 68:EPC1 72:PS */
     if (frame) {
-        printf("  Saved registers:\n");
+        ets_printf("  Saved registers:\n");
         static const char *rn[] = {"a0","a1","a2","a3","a4","a5","a6","a7",
                                    "a8","a9","a10","a11","a12","a13","a14","a15"};
         for (int i = 0; i < 16; i++) {
-            printf("    %-3s = 0x%08lx\n", rn[i], (unsigned long)frame[i]);
+            ets_printf("    %s = 0x%x\n", rn[i], (unsigned)frame[i]);
         }
-        printf("    SAR = 0x%08lx  PS = 0x%08lx\n",
-               (unsigned long)frame[16], (unsigned long)frame[18]);
+        ets_printf("    SAR = 0x%x  PS = 0x%x\n",
+                   (unsigned)frame[16], (unsigned)frame[18]);
     }
-    fflush(stdout);
-    printf("*** resetting ***\n");
-    fflush(stdout);
+    ets_printf("*** resetting ***\n");
     /* Trigger software system reset (preserves RTC STORE) */
+#if CONFIG_IDF_TARGET_ESP32
+    volatile uint32_t *options0 = (volatile uint32_t *)0x3FF48000;
+#else
     volatile uint32_t *options0 = (volatile uint32_t *)0x60008000;
+#endif
     *options0 |= (1u << 31);
     for (;;) {
         __asm__ volatile ("waiti 0");
@@ -79,10 +90,25 @@ void espradio_user_exception(uint32_t cause, uint32_t epc, uint32_t excvaddr, ui
 static void (*s_isr_fn[32])(void *);
 static void *s_isr_arg[32];
 
+/* Plausible executable address on ESP32: ROM/IRAM/flash-icache all live
+ * in 0x40000000–0x40400000.  Anything outside is a guaranteed bad fn ptr. */
+static inline int is_plausible_code_ptr(const void *p) {
+    uint32_t a = (uint32_t)p;
+    return a >= 0x40000000u && a < 0x40400000u;
+}
+
 void espradio_set_isr(int32_t n, void *f, void *arg) {
+    /* Log every registration so we can see which slots get populated and
+     * with what.  Registrations are infrequent (WiFi init/connect path). */
+    ets_printf("espradio_set_isr: n=%d f=%p arg=%p\n", (int)n, f, arg);
+    if (!is_plausible_code_ptr(f)) {
+        ets_printf("  WARNING: fn ptr not in code region!\n");
+    }
     if (n >= 0 && n < 32) {
         s_isr_fn[n] = (void (*)(void *))f;
         s_isr_arg[n] = arg;
+    } else {
+        ets_printf("  WARNING: slot %d out of range, ignored\n", (int)n);
     }
 }
 
@@ -94,14 +120,29 @@ __attribute__((weak))
 void espradio_wifi_isr_post_mask(void) {}
 
 static volatile uint32_t s_wifi_isr_count;
+/* Bit i set => slot i has already been logged once.  Bounded to 32 prints. */
+static volatile uint32_t s_isr_first_call_logged;
 void espradio_call_wifi_isr(void) {
     s_wifi_isr_count++;
     s_in_isr = 1;
     ESPRADIO_MEMORY_BARRIER();
     // CALL ALL ISRs from 0 to 31 just in case, to see if they are set!
     for (int i = 0; i < 32; i++) {
-        if (s_isr_fn[i]) {
-            s_isr_fn[i](s_isr_arg[i]);
+        void (*fn)(void *) = s_isr_fn[i];
+        if (fn) {
+            if (!is_plausible_code_ptr((void *)fn)) {
+                /* Bad function pointer — print and skip rather than crash. */
+                ets_printf("espradio_call_wifi_isr: slot %d has BAD fn=%p arg=%p, skipping\n",
+                           i, (void *)fn, s_isr_arg[i]);
+                continue;
+            }
+            uint32_t mask = 1u << i;
+            if ((s_isr_first_call_logged & mask) == 0) {
+                s_isr_first_call_logged |= mask;
+                ets_printf("espradio_call_wifi_isr: first call slot=%d fn=%p arg=%p\n",
+                           i, (void *)fn, s_isr_arg[i]);
+            }
+            fn(s_isr_arg[i]);
         }
     }
     ESPRADIO_MEMORY_BARRIER();

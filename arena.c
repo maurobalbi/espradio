@@ -1,7 +1,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <stdio.h>
+
+/* ROM printf only — never libprintf.a (varargs broken from Clang). */
+extern int ets_printf(const char *fmt, ...);
 
 /* Arena allocator: boundary-tag free-list allocator inside a Go-allocated pool.
  *
@@ -48,7 +50,7 @@ static size_t   arena_cap;
 static uint8_t *free_list;   /* singly-linked list of free blocks */
 
 #if 0
-#define ARENA_DBG(...) printf(__VA_ARGS__)
+#define ARENA_DBG(...) ets_printf(__VA_ARGS__)
 #else
 #define ARENA_DBG(...) ((void)0)
 #endif

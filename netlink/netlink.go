@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"time"
 
@@ -311,6 +312,7 @@ func handleStack(stack *espradio.Stack) {
 		send, recv, _ := stack.RecvAndSend()
 		if send == 0 && recv == 0 {
 			time.Sleep(pollTime)
+			runtime.Gosched()
 		}
 	}
 }
